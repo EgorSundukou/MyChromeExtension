@@ -74,12 +74,12 @@
     },
 
     loadStats: () => {
-      const stored = localStorage.getItem(Config.STATS_KEY);
+      const stored = sessionStorage.getItem(Config.STATS_KEY);
       return stored ? parseInt(stored, 10) : 0;
     },
 
     saveStats: (count) => {
-      localStorage.setItem(Config.STATS_KEY, count);
+      sessionStorage.setItem(Config.STATS_KEY, count);
     },
 
     incrementStats: () => {
@@ -300,7 +300,7 @@
     start: async () => {
       if (State.isRunning) return;
       State.isRunning = true;
-      localStorage.setItem(Config.STORAGE_KEY, 'true');
+      sessionStorage.setItem(Config.STORAGE_KEY, 'true');
       Logger.log('Started.');
 
       Heartbeat.start();
@@ -353,7 +353,7 @@
           }
 
           // Check Idle / Persistent Failure
-          if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+          if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
             Main.handlePersistentFailure('No buttons found after all attempts');
             return;
           } else {
@@ -371,7 +371,7 @@
 
     stop: () => {
       State.isRunning = false;
-      localStorage.removeItem(Config.STORAGE_KEY);
+      sessionStorage.removeItem(Config.STORAGE_KEY);
       Heartbeat.stop();
       Logger.log('Stopped.');
     },
@@ -379,7 +379,7 @@
     handlePersistentFailure: async (reason) => {
       Logger.warn(`${reason} -> Reloading page...`);
       // We pause briefly to ensure logs are written/seen
-      if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+      if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
         try { location.reload(); } catch (e) { Logger.error('Reload failed', e); }
         await Utils.sleep(Config.DELAYS.RELOAD);
       } else {
@@ -419,7 +419,7 @@
 
   // --- Auto-Start on Load ---
   window.addEventListener('load', () => {
-    if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+    if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
       setTimeout(() => Main.start(), 1000);
     }
   });
