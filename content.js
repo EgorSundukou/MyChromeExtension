@@ -1,451 +1,429 @@
 // content.js
-// Version: 1.4.1-clickfix
-// Changelog:
-//  - Robust click strategy: multiple click methods + verification after click.
-//  - Mark element as processed only after successful click (or if removed).
-//  - Keep "down-only" scrolling, verbose logging, tick handling, autostart flag, reload-on-no-buttons.
+// Version: 2.0.0-refactor
+// Implements: Modularization (#7), Async/Await (#8)
 
 (() => {
   if (window.__autoDeclineInjected) {
-    console.log('[autoDeclineFB] already injected - exiting');
+    console.log('[AutoDeclineFB] Script already injected.');
     return;
   }
   window.__autoDeclineInjected = true;
-  const SCRIPT_VERSION = '1.4.1-clickfix';
-  console.log(`[autoDeclineFB v${SCRIPT_VERSION}] content script loaded`);
 
-  // --- constants & settings ---
-  const STORAGE_KEY = '__autoDeclineUserStarted';
-  const TICK_RETRY_LIMIT = 3;
-  const CLICK_FAIL_LIMIT = 5;
-  const SOFT_RECOVERY_ATTEMPTS = 2;
-  const CLICK_FAIL_SOFT_RECOVERY = true;
-
-  const defaultSettings = {
-    textPatterns: [
-      'decline','reject','remove',
-      'отклон','отклонить','отказать','удалить'
+  // --- Configuration ---
+  const Config = {
+    VERSION: '2.0.0',
+    STORAGE_KEY: '__autoDeclineUserStarted',
+    STATS_KEY: '__autoDeclineStats',
+    TEXT_PATTERNS: [
+      'decline', 'reject', 'remove',
+      'отклон', 'отклонить', 'отказать', 'удалить'
     ],
-    clickDelay: () => 1000 + Math.random() * 500,
-    afterBatchDelay: 1200,
-    afterClickDelay: 700,
-    idleTimeout: 90000,
-    maxCycles: 500,
-    scrollWait: 4000,
-    endScrollDelay: 1500,
-    stableScrollChecks: 3,
-    endPageScrolls: 10,
-    activeTabIntervalMin: 3000,
-    activeTabIntervalMax: 4000,
-    reloadDelay: 5000
+    // Timeouts & Delays (ms)
+    DELAYS: {
+      CLICK_MIN: 1000,
+      CLICK_MAX: 1500,
+      AFTER_BATCH: 1200,
+      AFTER_CLICK: 700,
+      SCROLL_WAIT: 4000,
+      END_SCROLL: 1500,
+      RELOAD: 5000,
+      ACTIVE_TAB_MIN: 3000,
+      ACTIVE_TAB_MAX: 4000,
+      IDLE_TIMEOUT: 90000,
+    },
+    LIMITS: {
+      TICK_RETRY: 3,
+      CLICK_FAIL: 5,
+      SOFT_RECOVERY_ATTEMPTS: 2,
+      MAX_CYCLES: 500,
+    },
+    FLAGS: {
+      CLICK_FAIL_SOFT_RECOVERY: true,
+    }
   };
 
-  const log = (...a) => console.log(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...a);
-  const warn = (...a) => console.warn(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...a);
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const mergeOpts = opts => Object.assign({}, defaultSettings, opts || {});
-
-  // --- helpers ---
-  function isVisible(el) {
-    if (!el) return false;
-    try {
-      const rects = el.getClientRects();
-      if (!rects || rects.length === 0) return false;
-      const st = window.getComputedStyle(el);
-      if (!st) return false;
-      if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') return false;
-      return true;
-    } catch { return false; }
-  }
-
-  const candidateText = (el) => {
-    try {
-      return ((el.innerText || el.textContent || '') + ' ' + (el.getAttribute && (el.getAttribute('aria-label') || ''))).trim();
-    } catch { return ''; }
+  // --- Logger ---
+  const Logger = {
+    prefix: `[AutoDeclineFB v${Config.VERSION}]`,
+    log: (...args) => console.log(Logger.prefix, ...args),
+    warn: (...args) => console.warn(Logger.prefix, ...args),
+    error: (...args) => console.error(Logger.prefix, ...args),
   };
 
-  function makeFindActionButtons(textRegex) {
-    return () => {
+  // --- Utils ---
+  const Utils = {
+    sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+
+    randomDelay: (min, max) => min + Math.random() * (max - min),
+
+    isVisible: (el) => {
+      if (!el) return false;
+      try {
+        const rects = el.getClientRects();
+        if (!rects || rects.length === 0) return false;
+        const st = window.getComputedStyle(el);
+        if (!st) return false;
+        return st.visibility !== 'hidden' && st.display !== 'none' && st.opacity !== '0';
+      } catch (e) { return false; }
+    },
+
+    candidateText: (el) => {
+      try {
+        return ((el.innerText || el.textContent || '') + ' ' + (el.getAttribute && (el.getAttribute('aria-label') || ''))).trim();
+      } catch { return ''; }
+    },
+
+    loadStats: () => {
+      const stored = localStorage.getItem(Config.STATS_KEY);
+      return stored ? parseInt(stored, 10) : 0;
+    },
+
+    saveStats: (count) => {
+      localStorage.setItem(Config.STATS_KEY, count);
+    },
+
+    incrementStats: () => {
+      const current = Utils.loadStats();
+      Utils.saveStats(current + 1);
+      return current + 1;
+    }
+  };
+
+  // --- DOM Interaction ---
+  const DOM = {
+    findActionButtons: (textRegex) => {
       try {
         const nodes = Array.from(document.querySelectorAll('[role="button"], button, a'));
         return nodes.filter(el => {
-          try {
-            if (!el) return false;
-            if (el.dataset && el.dataset.__auto_declined) return false; // skip processed
-            if (!isVisible(el)) return false;
-            const txt = candidateText(el);
-            if (!txt) return false;
-            return textRegex.test(txt);
-          } catch { return false; }
+          if (!el || el.dataset && el.dataset.__auto_declined) return false;
+          if (!Utils.isVisible(el)) return false;
+          const txt = Utils.candidateText(el);
+          return txt && textRegex.test(txt);
         });
       } catch (e) {
-        warn('findActionButtons error', e);
+        Logger.warn('findActionButtons error:', e);
         return [];
       }
-    };
-  }
+    },
 
-  // --- Robust click routine ---
-  // Tries several strategies; verifies success by checking element removal/visibility/text.
-  let clickFailCount = 0;
-  async function tryClickElement(el, textRegex) {
-    if (!el) return false;
-    // Do not mark as processed before success.
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      log(`tryClickElement: attempt ${attempt} for`, el);
-      try {
-        // Bring into view (allowed)
-        try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); } catch (e) {}
-
-        await sleep(60 + Math.random() * 80);
-
-        const r = el.getBoundingClientRect();
-        const cx = Math.round(r.left + r.width / 2);
-        const cy = Math.round(r.top + r.height / 2);
-
-        // Method 1: dispatch mouse sequence on element + native click
-        if (attempt === 1) {
-          log('tryClickElement: method1 -> dispatch mouse events on element and el.click()');
-          try {
-            const evSeq = ['mouseover','mousemove','mousedown'];
-            evSeq.forEach(t => {
-              try {
-                el.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
-              } catch (e) {}
-            });
-            try { el.click && el.click(); } catch (e) {}
-            el.dispatchEvent(new MouseEvent('mouseup', { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
-            el.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
-          } catch (e) { warn('method1 error', e); }
-        }
-
-        // Method 2: pointer events on element
-        else if (attempt === 2) {
-          log('tryClickElement: method2 -> dispatch pointer events');
-          try {
-            const down = new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: cx, clientY: cy, isPrimary: true });
-            const up = new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: cx, clientY: cy, isPrimary: true });
-            el.dispatchEvent(down);
-            await sleep(20);
-            el.dispatchEvent(up);
-            await sleep(10);
-            try { el.click && el.click(); } catch (e) {}
-          } catch (e) { warn('method2 error', e); }
-        }
-
-        // Method 3: dispatch events to elementFromPoint (sometimes overlay intercepts)
-        else {
-          log('tryClickElement: method3 -> elementFromPoint dispatch + native click fallback');
-          try {
-            const target = document.elementFromPoint(cx, cy) || el;
-            ['mouseover','mousemove','mousedown'].forEach(t => {
-              try { target.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy })); } catch (e) {}
-            });
-            try { target.click && target.click(); } catch (e) {}
-            ['mouseup','click'].forEach(t => {
-              try { target.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy })); } catch (e) {}
-            });
-          } catch (e) { warn('method3 error', e); }
-        }
-
-        // wait a moment for UI to respond
-        await sleep(300 + Math.random() * 400);
-
-        // verify success: element removed OR not visible OR text no longer matches
-        try {
-          const stillInDom = document.contains(el);
-          const visibleNow = stillInDom && isVisible(el);
-          const textNow = stillInDom ? candidateText(el) : '';
-          const textMatches = textRegex.test(textNow);
-          log('tryClickElement: verification -> inDom:', stillInDom, 'visible:', visibleNow, 'textMatches:', textMatches);
-
-          if (!stillInDom || !visibleNow || !textMatches) {
-            // success: if still present mark processed, else can't (already removed)
-            try { if (stillInDom) el.dataset.__auto_declined = '1'; } catch (e) {}
-            clickFailCount = 0;
-            log('tryClickElement: success on attempt', attempt);
-            return true;
-          } else {
-            log('tryClickElement: not successful on attempt', attempt);
-            // continue to next attempt
-          }
-        } catch (e) {
-          warn('tryClickElement verification error', e);
-        }
-      } catch (e) {
-        warn('tryClickElement outer error', e);
-      }
-    } // attempts loop
-
-    // all attempts failed
-    clickFailCount++;
-    warn('tryClickElement: all attempts failed, clickFailCount=', clickFailCount);
-    return false;
-  }
-
-  // --- heartbeat ---
-  let keepActiveTimer = null;
-  function scheduleHeartbeat(settings) {
-    const heartbeat = () => { window.scrollBy(0, 0); requestAnimationFrame(() => {}); };
-    const run = () => {
-      const t = settings.activeTabIntervalMin + Math.random() * (settings.activeTabIntervalMax - settings.activeTabIntervalMin);
-      keepActiveTimer = setTimeout(() => { heartbeat(); run(); }, t);
-    };
-    run();
-  }
-  function clearHeartbeat() { if (keepActiveTimer) { clearTimeout(keepActiveTimer); keepActiveTimer = null; } }
-
-  // --- softRecovery (down-only) ---
-  async function softRecovery(settings) {
-    log('softRecovery: start (down-only)');
-    try {
-      const step = Math.max(200, Math.round((window.innerHeight || 800) * 0.15));
-      for (let i = 0; i < 3; i++) {
-        const target = Math.min(document.documentElement.scrollHeight - window.innerHeight, window.scrollY + step);
-        log(`softRecovery: scrolling down to ${target} (step ${i+1})`);
-        window.scrollTo({ top: target, behavior: 'auto' });
-        await sleep(600);
-      }
-      await sleep(400);
-    } catch (e) { warn('softRecovery error', e); }
-    log('softRecovery: done');
-  }
-
-  // --- main loop ---
-  let __running = false;
-  async function autoDeclineFB(opts = {}) {
-    if (__running) {
-      log('autoDeclineFB: already running');
-      return;
+    scrollTo: async (top) => {
+      window.scrollTo({ top, behavior: 'auto' });
+      // await Utils.sleep(100); // optional micro-wait
     }
-    __running = true;
-    window.__autoDeclineRunning = true;
+  };
 
-    const settings = mergeOpts(opts);
-    const textRegex = new RegExp((settings.textPatterns || []).join('|'), 'i');
-    const findActionButtons = makeFindActionButtons(textRegex);
+  // --- Click Logic ---
+  const Clicker = {
+    failCount: 0,
 
-    log('autoDeclineFB: starting. pattern:', textRegex);
-    scheduleHeartbeat(settings);
+    tryClick: async (el, textRegex) => {
+      if (!el) return false;
+      const maxAttempts = 3;
 
-    let lastActionTime = Date.now();
-    let cycles = 0;
-    let softRecoveryAttempts = 0;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Stop check could be inserted here if we had a global abort signal
+        if (!State.isRunning) return false;
 
-    try {
-      while (window.__autoDeclineRunning) {
-        cycles++;
-        log(`main loop #${cycles}: searching for action elements`);
-        const elems = findActionButtons();
+        Logger.log(`Click Attempt ${attempt} on`, el);
 
-        if (elems.length > 0) {
-          log(`found ${elems.length} element(s) — will try click on first one`);
-          const el = elems[0];
-          const ok = await tryClickElement(el, textRegex);
-          if (ok) {
-            lastActionTime = Date.now();
-            log('click succeeded; waiting afterClickDelay', settings.afterClickDelay);
-            await sleep(settings.afterClickDelay);
-            continue;
-          } else {
-            log('click attempts failed on this element');
-            if (CLICK_FAIL_SOFT_RECOVERY && clickFailCount >= CLICK_FAIL_LIMIT) {
-              log('clickFailCount exceeded -> attempting softRecovery');
-              await softRecovery(settings);
-              softRecoveryAttempts++;
-              if (clickFailCount >= CLICK_FAIL_LIMIT) {
-                if (localStorage.getItem(STORAGE_KEY) === 'true') {
-                  warn('Click failures persist -> reloading (user started)');
-                  try { location.reload(); } catch (e) { warn('reload failed', e); }
-                  await sleep(settings.reloadDelay);
-                  return;
-                } else {
-                  warn('Click failures persist but user did not start -> stop');
-                  break;
-                }
-              }
-            } else {
-              // small pause and continue loop
-              await sleep(300);
-              continue;
-            }
-          }
+        try {
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+        } catch (e) { }
+
+        await Utils.sleep(Utils.randomDelay(60, 140));
+
+        const rect = el.getBoundingClientRect();
+        const cx = Math.round(rect.left + rect.width / 2);
+        const cy = Math.round(rect.top + rect.height / 2);
+
+        // Strategy depends on attempt number
+        try {
+          if (attempt === 1) Clicker.methodStandard(el, cx, cy);
+          else if (attempt === 2) await Clicker.methodPointer(el, cx, cy);
+          else Clicker.methodElementFromPoint(el, cx, cy);
+        } catch (e) {
+          Logger.warn(`Method ${attempt} failed`, e);
         }
 
-        // no visible matches: progressive down-only scrolls
-        log('no visible matches -> progressive scrolls (25% x5 then full-height x5) DOWN-ONLY');
-        const totalHeight = Math.max(document.documentElement.scrollHeight, 1);
-        const maxScrollTop = Math.max(0, totalHeight - window.innerHeight);
+        await Utils.sleep(Utils.randomDelay(300, 700));
 
-        // 5 steps of 25%
-        let foundDuringQuarter = false;
-        for (let i = 1; i <= 5; i++) {
-          if (!window.__autoDeclineRunning) break;
-          const target = Math.min(maxScrollTop, Math.round(totalHeight * 0.25 * i));
-          const effectiveTarget = target > window.scrollY ? target : Math.min(maxScrollTop, window.scrollY + Math.max(100, Math.round(totalHeight * 0.05)));
-          log(`quarter-step ${i}: scrolling down to ${effectiveTarget} (calc ${target}, cur ${window.scrollY})`);
-          window.scrollTo({ top: effectiveTarget, behavior: 'auto' });
-          await sleep(settings.scrollWait);
-          const got = findActionButtons();
-          if (got.length > 0) { log(`found ${got.length} after quarter ${i}`); foundDuringQuarter = true; break; }
+        // Verification
+        if (Clicker.verifySuccess(el, textRegex)) {
+          Clicker.failCount = 0;
+          Utils.incrementStats(); // Update stats
+          return true;
         }
-        if (foundDuringQuarter) continue;
+      }
 
-        // 5 steps full window height down
-        let foundDuringFull = false;
-        for (let j = 1; j <= 5; j++) {
-          if (!window.__autoDeclineRunning) break;
-          const next = Math.min(window.scrollY + window.innerHeight, maxScrollTop);
-          if (next <= window.scrollY && window.scrollY >= maxScrollTop) {
-            log(`full-step ${j}: at bottom (${window.scrollY}), breaking full-step loop`);
-            break;
-          }
-          log(`full-step ${j}: scrolling down to ${next}`);
-          window.scrollTo({ top: next, behavior: 'auto' });
-          await sleep(settings.endScrollDelay);
-          const got = findActionButtons();
-          if (got.length > 0) { log(`found ${got.length} after full-step ${j}`); foundDuringFull = true; break; }
+      Clicker.failCount++;
+      Logger.warn('All click attempts failed. Fail count:', Clicker.failCount);
+      return false;
+    },
+
+    methodStandard: (el, cx, cy) => {
+      ['mouseover', 'mousemove', 'mousedown'].forEach(type => {
+        el.dispatchEvent(new MouseEvent(type, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+      });
+      el.click();
+      ['mouseup', 'click'].forEach(type => {
+        el.dispatchEvent(new MouseEvent(type, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+      });
+    },
+
+    methodPointer: async (el, cx, cy) => {
+      const opts = { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: cx, clientY: cy, isPrimary: true };
+      el.dispatchEvent(new PointerEvent('pointerdown', opts));
+      await Utils.sleep(20);
+      el.dispatchEvent(new PointerEvent('pointerup', opts));
+      await Utils.sleep(10);
+      el.click();
+    },
+
+    methodElementFromPoint: (el, cx, cy) => {
+      const target = document.elementFromPoint(cx, cy) || el;
+      // Standard sequence on the potentially covering element
+      Clicker.methodStandard(target, cx, cy);
+    },
+
+    verifySuccess: (el, textRegex) => {
+      try {
+        const stillInDom = document.contains(el);
+        const visible = stillInDom && Utils.isVisible(el);
+        const textValues = stillInDom ? Utils.candidateText(el) : '';
+        const matches = textRegex.test(textValues);
+
+        const success = !stillInDom || !visible || !matches;
+
+        if (success) {
+          if (stillInDom) el.dataset.__auto_declined = '1';
+          return true;
         }
-        if (foundDuringFull) continue;
+        return false;
+      } catch (e) {
+        Logger.warn('Verification error:', e);
+        return false;
+      }
+    }
+  };
 
-        // short wait + retry
-        log('no matches after progressive scrolls -> waiting and retrying');
-        await sleep(800);
-        const retry = findActionButtons();
-        if (retry.length > 0) { log(`found ${retry.length} on retry`); lastActionTime = Date.now(); continue; }
+  // --- Core Logic ---
+  const State = {
+    isRunning: false,
+    heartbeatTimer: null,
+    tickNoButtonsCount: 0,
+    softRecoveryAttempts: 0,
+    lastActionTime: 0
+  };
 
-        // softRecovery attempts (down-only)
-        softRecoveryAttempts++;
-        if (softRecoveryAttempts <= SOFT_RECOVERY_ATTEMPTS) {
-          log(`softRecovery attempt #${softRecoveryAttempts} (down-only)`);
-          await softRecovery(settings);
-          const after = findActionButtons();
-          if (after.length > 0) { log(`found ${after.length} after softRecovery`); lastActionTime = Date.now(); continue; }
-          else { log('softRecovery did not reveal matches'); continue; }
+  const Navigation = {
+    softRecovery: async () => {
+      Logger.log('Executing Soft Recovery (scrolling)...');
+      try {
+        const step = Math.max(200, Math.round((window.innerHeight || 800) * 0.15));
+        for (let i = 0; i < 3; i++) {
+          if (!State.isRunning) break;
+          const target = Math.min(document.documentElement.scrollHeight - window.innerHeight, window.scrollY + step);
+          await DOM.scrollTo(target);
+          await Utils.sleep(600);
         }
+        await Utils.sleep(400);
+      } catch (e) { Logger.warn('SoftRecovery error:', e); }
+    },
 
-        // exhausted attempts -> reload if user started, else stop
-        if (localStorage.getItem(STORAGE_KEY) === 'true') {
-          warn('No matches after all attempts -> reloading page (user started)');
-          try { location.reload(); } catch (e) { warn('reload failed', e); }
-          await sleep(settings.reloadDelay);
-          return;
-        } else {
-          log('No matches after all attempts and user did not start -> stopping');
+    progressiveScroll: async (findCallback) => {
+      Logger.log('Starting Progressive Scroll...');
+      const totalHeight = Math.max(document.documentElement.scrollHeight, 1);
+      const maxScroll = Math.max(0, totalHeight - window.innerHeight);
+
+      // Quarter Steps (Increased for more granual load attempts)
+      for (let i = 1; i <= 10; i++) {
+        if (!State.isRunning) return false;
+        // Calculate target relative to total height, but ensuring we move past current scroll
+        const target = Math.min(maxScroll, Math.round(totalHeight * (i * 0.1))); // 10% increments
+
+        // If we are already past this target, just scroll down a bit more
+        const effective = target > window.scrollY ? target : Math.min(maxScroll, window.scrollY + window.innerHeight * 0.5);
+
+        Logger.log(`Scroll Step (Small) ${i}/10 to ${effective}`);
+        await DOM.scrollTo(effective);
+        await Utils.sleep(Config.DELAYS.SCROLL_WAIT);
+
+        if (findCallback().length > 0) return true;
+      }
+
+      // Full Page Steps (Increased depth for long lists)
+      for (let j = 1; j <= 15; j++) {
+        if (!State.isRunning) return false;
+        const next = Math.min(window.scrollY + window.innerHeight, maxScroll);
+
+        if (next <= window.scrollY && window.scrollY >= maxScroll) {
+          Logger.log('Reached bottom of page.');
           break;
         }
 
-        // idle fallback (kept but down-only recovery)
-        if (Date.now() - lastActionTime >= settings.idleTimeout) {
-          log('idleTimeout reached -> softRecovery (down-only) then conditional reload/stop');
-          await softRecovery(settings);
-          if (Date.now() - lastActionTime >= settings.idleTimeout) {
-            if (localStorage.getItem(STORAGE_KEY) === 'true') {
-              warn('idle persists -> reloading (user started)');
-              try { location.reload(); } catch (e) { warn('reload failed', e); }
-              await sleep(settings.reloadDelay);
-              return;
+        Logger.log(`Scroll Step (Full) ${j}/15 to ${next}`);
+        await DOM.scrollTo(next);
+        // FORCE a small scroll up and down to trigger lazy loaders
+        window.scrollBy(0, -10);
+        await Utils.sleep(100);
+        window.scrollBy(0, 10);
+
+        await Utils.sleep(Config.DELAYS.END_SCROLL);
+
+        if (findCallback().length > 0) return true;
+      }
+      return false;
+    }
+  };
+
+  const Heartbeat = {
+    start: () => {
+      if (State.heartbeatTimer) clearTimeout(State.heartbeatTimer);
+      const run = () => {
+        if (!State.isRunning) return;
+        // Micro-scroll to keep tab active
+        window.scrollBy(0, 0);
+        requestAnimationFrame(() => { });
+
+        const delay = Utils.randomDelay(Config.DELAYS.ACTIVE_TAB_MIN, Config.DELAYS.ACTIVE_TAB_MAX);
+        State.heartbeatTimer = setTimeout(run, delay);
+      };
+      run();
+    },
+    stop: () => {
+      if (State.heartbeatTimer) clearTimeout(State.heartbeatTimer);
+      State.heartbeatTimer = null;
+    }
+  };
+
+  const Main = {
+    start: async () => {
+      if (State.isRunning) return;
+      State.isRunning = true;
+      localStorage.setItem(Config.STORAGE_KEY, 'true');
+      Logger.log('Started.');
+
+      Heartbeat.start();
+
+      const textRegex = new RegExp(Config.TEXT_PATTERNS.join('|'), 'i');
+      State.lastActionTime = Date.now();
+
+      try {
+        while (State.isRunning) {
+          const buttons = DOM.findActionButtons(textRegex);
+
+          if (buttons.length > 0) {
+            Logger.log(`Found ${buttons.length} buttons.`);
+            const success = await Clicker.tryClick(buttons[0], textRegex);
+
+            if (success) {
+              State.lastActionTime = Date.now();
+              await Utils.sleep(Config.DELAYS.AFTER_CLICK);
+              continue;
             } else {
-              log('idle persists and user flag absent -> stopping');
-              break;
+              // Click failed
+              if (Config.FLAGS.CLICK_FAIL_SOFT_RECOVERY && Clicker.failCount >= Config.LIMITS.CLICK_FAIL) {
+                Logger.warn('Click fail limit reached. Attempting recovery.');
+                await Navigation.softRecovery();
+                if (Clicker.failCount >= Config.LIMITS.CLICK_FAIL) {
+                  Main.handlePersistentFailure('Click failures persist');
+                  return; // Stop/Reload triggers inside handlePersistentFailure
+                }
+              } else {
+                await Utils.sleep(300);
+                continue;
+              }
             }
           }
-        }
 
-      } // while
-    } catch (e) {
-      warn('autoDeclineFB encountered error', e);
-    } finally {
-      clearHeartbeat();
-      window.__autoDeclineRunning = false;
-      __running = false;
-      log('autoDeclineFB: finished');
-    }
-  }
+          // No buttons found
+          Logger.log('No buttons found. Attempting scroll...');
+          const foundAfterScroll = await Navigation.progressiveScroll(() => DOM.findActionButtons(textRegex));
+          if (foundAfterScroll) continue;
 
-  // --- messages ---
-  let tickNoButtonsCount = 0;
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    try {
-      log('onMessage:', msg, 'from', sender && sender.id ? sender.id : sender);
-      try {
-        if (sender && sender.id && chrome && chrome.runtime && chrome.runtime.id && sender.id !== chrome.runtime.id) {
-          log('onMessage: message from other extension - ignoring');
-          return;
-        }
-      } catch (e) {}
-      if (!msg || !msg.type) return;
+          // Retry after wait
+          await Utils.sleep(800);
+          if (DOM.findActionButtons(textRegex).length > 0) continue;
 
-      if (msg.type === 'start') {
-        log('onMessage: START - setting local flag and starting');
-        localStorage.setItem(STORAGE_KEY, 'true');
-        if (!window.__autoDeclineRunning) autoDeclineFB();
-        sendResponse && sendResponse({ ok: true });
-      } else if (msg.type === 'stop') {
-        log('onMessage: STOP - removing local flag and stopping');
-        localStorage.removeItem(STORAGE_KEY);
-        window.__autoDeclineRunning = false;
-        sendResponse && sendResponse({ ok: true });
-      } else if (msg.type === 'status') {
-        sendResponse && sendResponse({ running: !!window.__autoDeclineRunning });
-      } else if (msg.type === 'tick') {
-        const settings = mergeOpts();
-        const textRegex = new RegExp((settings.textPatterns || []).join('|'), 'i');
-        const findActionButtons = makeFindActionButtons(textRegex);
-        const found = findActionButtons();
-        if (found.length > 0) {
-          tickNoButtonsCount = 0;
-          log(`tick: found ${found.length} buttons - attempting immediate quick clicks`);
-          (async () => {
-            try {
-              const limit = Math.min(found.length, 2);
-              for (let i=0; i<limit; i++) {
-                await tryClickElement(found[i], textRegex);
-                await sleep(200 + Math.random()*200);
-              }
-            } catch (e) { warn('tick immediate click error', e); }
-          })();
-        } else {
-          tickNoButtonsCount++;
-          log('tick: no buttons; tickNoButtonsCount=', tickNoButtonsCount);
-          if (tickNoButtonsCount >= TICK_RETRY_LIMIT) {
-            tickNoButtonsCount = 0;
-            log('tick: exceeded TICK_RETRY_LIMIT -> softRecovery then conditional reload (down-only)');
-            (async () => {
-              await softRecovery(mergeOpts());
-              const after = makeFindActionButtons(new RegExp((mergeOpts().textPatterns || []).join('|'), 'i'))();
-              if (after.length > 0) {
-                log('tick recovery: buttons appeared after softRecovery -> starting processing');
-                if (!window.__autoDeclineRunning) autoDeclineFB();
-              } else {
-                if (localStorage.getItem(STORAGE_KEY) === 'true') {
-                  warn('tick recovery: no buttons -> reloading (user started)');
-                  try { location.reload(); } catch (e) { warn('reload failed', e); }
-                } else {
-                  log('tick recovery: no buttons and user flag absent -> no reload');
-                }
-              }
-            })();
+          // Soft Recovery
+          State.softRecoveryAttempts++;
+          if (State.softRecoveryAttempts <= Config.LIMITS.SOFT_RECOVERY_ATTEMPTS) {
+            await Navigation.softRecovery();
+            if (DOM.findActionButtons(textRegex).length > 0) continue;
+          }
+
+          // Check Idle / Persistent Failure
+          if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+            Main.handlePersistentFailure('No buttons found after all attempts');
+            return;
+          } else {
+            Logger.log('No buttons found and user did not auto-start. Stopping.');
+            Main.stop();
+            break;
           }
         }
+      } catch (e) {
+        Logger.error('Main loop crash:', e);
+      } finally {
+        Main.stop();
       }
-    } catch (e) { warn('onMessage handler error', e); }
-  });
+    },
 
-  // autostart on load only if user previously pressed START
-  window.addEventListener('load', () => {
-    try {
-      log('page load: checking autostart flag in localStorage');
-      const shouldAuto = localStorage.getItem(STORAGE_KEY) === 'true';
-      if (shouldAuto) {
-        log('page load: user had started previously -> auto-starting');
-        if (!window.__autoDeclineRunning) autoDeclineFB();
+    stop: () => {
+      State.isRunning = false;
+      localStorage.removeItem(Config.STORAGE_KEY);
+      Heartbeat.stop();
+      Logger.log('Stopped.');
+    },
+
+    handlePersistentFailure: async (reason) => {
+      Logger.warn(`${reason} -> Reloading page...`);
+      // We pause briefly to ensure logs are written/seen
+      if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+        try { location.reload(); } catch (e) { Logger.error('Reload failed', e); }
+        await Utils.sleep(Config.DELAYS.RELOAD);
       } else {
-        log('page load: user flag absent -> not auto-starting');
+        Main.stop();
       }
-    } catch (e) { warn('load handler error', e); }
+    }
+  };
+
+  // --- Message Handling ---
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // Ignore updates from other extensions if any
+    if (sender.id && sender.id !== chrome.runtime.id) return;
+
+    switch (msg.type) {
+      case 'start':
+        Main.start();
+        sendResponse({ ok: true });
+        break;
+      case 'stop':
+        Main.stop();
+        sendResponse({ ok: true });
+        break;
+      case 'status':
+        sendResponse({
+          running: State.isRunning,
+          stats: Utils.loadStats()
+        });
+        break;
+      case 'tick':
+        if (!State.isRunning) {
+          // Check auto-start on content load / reload
+          // But this is just a 'tick' from background. Ideally we only check logic.
+        }
+        break;
+    }
   });
 
-  log('content.js ready (v' + SCRIPT_VERSION + ')');
+  // --- Auto-Start on Load ---
+  window.addEventListener('load', () => {
+    if (localStorage.getItem(Config.STORAGE_KEY) === 'true') {
+      setTimeout(() => Main.start(), 1000);
+    }
+  });
+
+  Logger.log('Ready.');
+
 })();

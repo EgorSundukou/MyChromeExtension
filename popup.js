@@ -1,126 +1,107 @@
-// popup.js (обновлённый)
-// Отправляет сообщения в активную вкладку и, если нужно, инжектит content.js и повторяет.
+// popup.js
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
-const statusBtn = document.getElementById("statusBtn");
 const statusDiv = document.getElementById("status");
+const statsCountDiv = document.getElementById("statsCount");
 
+// --- Event Listeners ---
 startBtn.addEventListener("click", () => {
-  setStatus("Отправляю команду START...");
-  sendMessageToActiveTab({ type: "start" });
+  setStatus("Starting...");
+  sendMessageToActiveTab({ type: "start" }, (res) => {
+    if (res && res.ok) setStatus("Running...");
+  });
+  // Auto-refresh stats/status a bit later
+  setTimeout(updateUI, 1000);
 });
 
 stopBtn.addEventListener("click", () => {
-  setStatus("Отправляю команду STOP...");
-  sendMessageToActiveTab({ type: "stop" });
+  setStatus("Stopping...");
+  sendMessageToActiveTab({ type: "stop" }, (res) => {
+    if (res && res.ok) setStatus("Stopped.");
+  });
+  setTimeout(updateUI, 500);
 });
 
-statusBtn.addEventListener("click", () => {
-  setStatus("Запрашиваю статус...");
-  sendMessageToActiveTab({ type: "status" });
-});
-
+// --- UI Updates ---
 function setStatus(text) {
   if (statusDiv) statusDiv.textContent = text;
 }
 
-// Основная функция отправки — пробует послать сообщение, если получит ошибку "no receiver" — инжектит content.js и повторяет
-function sendMessageToActiveTab(msg) {
+function setStats(count) {
+  if (statsCountDiv) statsCountDiv.textContent = count || 0;
+}
+
+function updateUI() {
+  sendMessageToActiveTab({ type: "status" }, (response) => {
+    if (response) {
+      setStatus(response.running ? "Running..." : "Stopped.");
+      setStats(response.stats);
+    } else {
+      setStatus("Not active on this page.");
+    }
+  });
+}
+
+// --- Messaging Logic ---
+function sendMessageToActiveTab(msg, callback) {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (!tabs || !tabs[0]) {
-      setStatus("Нет активной вкладки");
+      setStatus("No active tab.");
       return;
     }
     const tabId = tabs[0].id;
 
-    // Отправляем сообщение
+    // Send message
     chrome.tabs.sendMessage(tabId, msg, (response) => {
-      // Если нет получателя (content script не слушает), chrome.runtime.lastError будет установлен
       if (chrome.runtime.lastError) {
         console.warn("sendMessage error:", chrome.runtime.lastError.message);
-        // Попытаться внедрить content.js и повторить
-        injectContentScriptAndRetry(tabId, msg);
+        // If content script is missing, try to inject (if allowed by manifest match patterns)
+        injectContentScriptAndRetry(tabId, msg, callback);
         return;
       }
-
-      // Если есть ответ — обработаем его
+      if (callback) callback(response);
       handleResponse(msg, response);
     });
   });
 }
 
-// Внедряет content.js в вкладку (MV3 -> chrome.scripting, иначе MV2 -> chrome.tabs.executeScript) и повторяет отправку
-function injectContentScriptAndRetry(tabId, msg) {
-  setStatus("Content script не найден — внедряю и повторяю команду...");
+function injectContentScriptAndRetry(tabId, msg, callback) {
+  setStatus("Injecting script...");
 
-  const afterInject = () => {
-    // Небольшая задержка чтобы content.js успел инициализироваться
-    setTimeout(() => {
-      chrome.tabs.sendMessage(tabId, msg, (response) => {
-        if (chrome.runtime.lastError) {
-          console.error("Повторная отправка сообщения не удалась:", chrome.runtime.lastError.message);
-          setStatus("Не удалось связаться с content script: " + chrome.runtime.lastError.message);
-          return;
-        }
-        handleResponse(msg, response);
-      });
-    }, 400); // 400ms — обычно достаточно; можно увеличить при необходимости
-  };
-
-  // MV3: chrome.scripting.executeScript
   if (chrome.scripting && chrome.scripting.executeScript) {
     chrome.scripting.executeScript(
       { target: { tabId }, files: ["content.js"] },
-      (injectionResults) => {
+      () => {
         if (chrome.runtime.lastError) {
-          console.error("chrome.scripting.executeScript failed:", chrome.runtime.lastError.message);
-          setStatus("Ошибка внедрения content.js: " + chrome.runtime.lastError.message);
+          console.error("Injection failed:", chrome.runtime.lastError.message);
+          setStatus("Injection failed: " + chrome.runtime.lastError.message);
           return;
         }
-        console.log("content.js внедрён (MV3).");
-        afterInject();
+        // Success
+        setTimeout(() => {
+          chrome.tabs.sendMessage(tabId, msg, (response) => {
+            if (callback) callback(response);
+            handleResponse(msg, response);
+          });
+        }, 200);
       }
     );
-    return;
+  } else {
+    setStatus("Injection API not available.");
   }
-
-  // MV2 fallback: chrome.tabs.executeScript
-  if (chrome.tabs && chrome.tabs.executeScript) {
-    chrome.tabs.executeScript(tabId, { file: "content.js" }, (res) => {
-      if (chrome.runtime.lastError) {
-        console.error("chrome.tabs.executeScript failed:", chrome.runtime.lastError.message);
-        setStatus("Ошибка внедрения content.js: " + chrome.runtime.lastError.message);
-        return;
-      }
-      console.log("content.js внедрён (MV2).");
-      afterInject();
-    });
-    return;
-  }
-
-  setStatus("Невозможно внедрить content.js (API отсутствует).");
 }
 
-// Обработка ответов от content.js
 function handleResponse(msg, response) {
-  if (!msg || !msg.type) return;
-
-  switch (msg.type) {
-    case "start":
-      setStatus("Команда START отправлена.");
-      // Можно обновить UI: например, отключить кнопку start
-      break;
-    case "stop":
-      setStatus("Команда STOP отправлена.");
-      break;
-    case "status":
-      if (!response) {
-        setStatus("Нет ответа от content script.");
-      } else {
-        setStatus(response.running ? "Скрипт работает" : "Скрипт остановлен");
-      }
-      break;
-    default:
-      setStatus("Команда отправлена.");
+  if (response && response.stats !== undefined) {
+    setStats(response.stats);
+  }
+  // Also refresh status if we just queried it
+  if (msg.type === 'status' && !response) {
+    setStatus("Script not ready.");
   }
 }
+
+// Initial UI check
+document.addEventListener('DOMContentLoaded', updateUI);
+// Periodic Poll while popup is open
+setInterval(updateUI, 2000);

@@ -2,7 +2,7 @@
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log("Auto Decline FB: installed");
-  // Периодический «тик», чтобы поддерживать процесс (1 раз в минуту — мин. период для alarms)
+  // Periodic 'tick' needed to keep the service worker alive and check content script health
   chrome.alarms.create("decliner-tick", { periodInMinutes: 1 });
 });
 
@@ -12,21 +12,17 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// Пингуем все открытые вкладки с facebook-группами
+// Pings all open Facebook group tabs
 function pingAllGroupTabs() {
   chrome.tabs.query({ url: ["*://www.facebook.com/groups/*", "*://facebook.com/groups/*"] }, (tabs) => {
     for (const tab of tabs) {
-      // пробуем отправить «tick»; контент-скрипт сам решит, что делать
-      chrome.tabs.sendMessage(tab.id, { type: "tick" }, () => { /* игнор */ });
+      // Send a 'tick' message; content script can decide what to do
+      chrome.tabs.sendMessage(tab.id, { type: "tick" }, () => {
+        if (chrome.runtime.lastError) {
+          // Content script might not be injected or tab is loading
+          // We can optionally inject here if needed, but usually popup handles start
+        }
+      });
     }
   });
 }
-
-// Когда вкладка загрузилась — посылаем «start»
-// chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-//   if (!tab || !tab.url) return;
-//   const isGroup = tab.url.includes("facebook.com/groups/");
-//   if (changeInfo.status === "complete" && isGroup) {
-//     chrome.tabs.sendMessage(tabId, { type: "start" }, () => { /* игнор */ });
-//   }
-// });
