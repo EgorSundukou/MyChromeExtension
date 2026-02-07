@@ -1,60 +1,51 @@
 // content.js
-// Version: 1.3-revert
+// Version: 1.4.1-clickfix
 // Changelog:
-//  - Revert to previous reliable click behavior (click element center and dispatch mouse events).
-//  - Keep improvements: detailed logging, tick handling, softRecovery, reload-on-no-buttons (only if user started), localStorage autostart flag.
-//  - Add more verbose logs for every major action to help debugging.
-//
-// Usage:
-//  - popup should send {type: "start"} and {type: "stop"} via chrome.tabs.sendMessage(tabId, msg).
-//  - After manual START content script will set localStorage flag and auto-restart after reloads.
-//  - STOP removes flag and stops automatic restarts.
+//  - Robust click strategy: multiple click methods + verification after click.
+//  - Mark element as processed only after successful click (or if removed).
+//  - Keep "down-only" scrolling, verbose logging, tick handling, autostart flag, reload-on-no-buttons.
 
 (() => {
-  // --- guard against double injection ---
   if (window.__autoDeclineInjected) {
     console.log('[autoDeclineFB] already injected - exiting');
     return;
   }
   window.__autoDeclineInjected = true;
-  console.log('[autoDeclineFB] content script loaded (v1.3-revert)');
+  const SCRIPT_VERSION = '1.4.1-clickfix';
+  console.log(`[autoDeclineFB v${SCRIPT_VERSION}] content script loaded`);
 
   // --- constants & settings ---
-  const SCRIPT_VERSION = '1.3-revert';
-  const STORAGE_KEY = '__autoDeclineUserStarted'; // localStorage key to remember user-start
-  const TICK_RETRY_LIMIT = 3;   // how many ticks without buttons => softRecovery/reload logic
-  const CLICK_FAIL_LIMIT = 5;   // how many click failures in a row => softRecovery/reload
-  const SOFT_RECOVERY_ATTEMPTS = 2; // number of softRecoveries before reload
-  const CLICK_FAIL_SOFT_RECOVERY = true; // attempt softRecovery on click failures
+  const STORAGE_KEY = '__autoDeclineUserStarted';
+  const TICK_RETRY_LIMIT = 3;
+  const CLICK_FAIL_LIMIT = 5;
+  const SOFT_RECOVERY_ATTEMPTS = 2;
+  const CLICK_FAIL_SOFT_RECOVERY = true;
 
   const defaultSettings = {
     textPatterns: [
       'decline','reject','remove',
       'отклон','отклонить','отказать','удалить'
-    ], // patterns to search (case-insensitive)
-    clickDelay: () => 1000 + Math.random() * 500, // ms between clicks
-    afterBatchDelay: 1200, // ms pause after batch of clicks
-    idleTimeout: 90000, // ms before considering idle -> recovery
+    ],
+    clickDelay: () => 1000 + Math.random() * 500,
+    afterBatchDelay: 1200,
+    afterClickDelay: 700,
+    idleTimeout: 90000,
     maxCycles: 500,
-    scrollWait: 4000, // ms after standard scroll
-    endScrollDelay: 1500, // ms between end-of-page micro-scrolls
-    stableScrollChecks: 3, // how many identical document heights indicate "bottom"
-    endPageScrolls: 10, // extra scrolls in bottom area
+    scrollWait: 4000,
+    endScrollDelay: 1500,
+    stableScrollChecks: 3,
+    endPageScrolls: 10,
     activeTabIntervalMin: 3000,
     activeTabIntervalMax: 4000,
-    reloadDelay: 5000 // ms wait after location.reload()
+    reloadDelay: 5000
   };
 
-  // --- logging helpers ---
-  const log = (...args) => console.log(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...args);
-  const warn = (...args) => console.warn(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...args);
+  const log = (...a) => console.log(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...a);
+  const warn = (...a) => console.warn(`[autoDeclineFB v${SCRIPT_VERSION}]`, ...a);
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const mergeOpts = opts => Object.assign({}, defaultSettings, opts || {});
 
-  // --- small utilities ---
-  function mergeOpts(opts) {
-    return Object.assign({}, defaultSettings, opts || {});
-  }
-
+  // --- helpers ---
   function isVisible(el) {
     if (!el) return false;
     try {
@@ -64,17 +55,13 @@
       if (!st) return false;
       if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') return false;
       return true;
-    } catch (e) {
-      return false;
-    }
+    } catch { return false; }
   }
 
   const candidateText = (el) => {
     try {
       return ((el.innerText || el.textContent || '') + ' ' + (el.getAttribute && (el.getAttribute('aria-label') || ''))).trim();
-    } catch {
-      return '';
-    }
+    } catch { return ''; }
   };
 
   function makeFindActionButtons(textRegex) {
@@ -84,14 +71,12 @@
         return nodes.filter(el => {
           try {
             if (!el) return false;
-            if (el.dataset && el.dataset.__auto_declined) return false; // already handled
+            if (el.dataset && el.dataset.__auto_declined) return false; // skip processed
             if (!isVisible(el)) return false;
             const txt = candidateText(el);
             if (!txt) return false;
             return textRegex.test(txt);
-          } catch (e) {
-            return false;
-          }
+          } catch { return false; }
         });
       } catch (e) {
         warn('findActionButtons error', e);
@@ -100,97 +85,130 @@
     };
   }
 
-  // --- human-like click (reliable, center-of-element approach) ---
+  // --- Robust click routine ---
+  // Tries several strategies; verifies success by checking element removal/visibility/text.
   let clickFailCount = 0;
-  async function humanClick(el) {
-    try {
-      if (!el) throw new Error('element is null');
-      // mark first to avoid double processing
-      el.dataset.__auto_declined = '1';
+  async function tryClickElement(el, textRegex) {
+    if (!el) return false;
+    // Do not mark as processed before success.
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      log(`tryClickElement: attempt ${attempt} for`, el);
+      try {
+        // Bring into view (allowed)
+        try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); } catch (e) {}
 
-      // try to bring element into view
-      try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); } catch (e) {}
+        await sleep(60 + Math.random() * 80);
 
-      // small pause to let any UI animations settle
-      await sleep(80 + Math.random() * 120);
+        const r = el.getBoundingClientRect();
+        const cx = Math.round(r.left + r.width / 2);
+        const cy = Math.round(r.top + r.height / 2);
 
-      // compute center coords
-      const r = el.getBoundingClientRect();
-      const cx = Math.round(r.left + r.width/2);
-      const cy = Math.round(r.top + r.height/2);
-
-      // dispatch sequence of mouse events targeted at element (using element.dispatchEvent)
-      const dispatchTo = (targetEl, type, clientX = cx, clientY = cy) => {
-        try {
-          const ev = new MouseEvent(type, {
-            view: window,
-            bubbles: true,
-            cancelable: true,
-            clientX,
-            clientY,
-            button: 0
-          });
-          targetEl.dispatchEvent(ev);
-        } catch (e) {
-          // ignore
+        // Method 1: dispatch mouse sequence on element + native click
+        if (attempt === 1) {
+          log('tryClickElement: method1 -> dispatch mouse events on element and el.click()');
+          try {
+            const evSeq = ['mouseover','mousemove','mousedown'];
+            evSeq.forEach(t => {
+              try {
+                el.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+              } catch (e) {}
+            });
+            try { el.click && el.click(); } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mouseup', { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+            el.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+          } catch (e) { warn('method1 error', e); }
         }
-      };
 
-      // try dispatch on element, but fall back to elementFromPoint if needed
-      const target = el;
+        // Method 2: pointer events on element
+        else if (attempt === 2) {
+          log('tryClickElement: method2 -> dispatch pointer events');
+          try {
+            const down = new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: cx, clientY: cy, isPrimary: true });
+            const up = new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: cx, clientY: cy, isPrimary: true });
+            el.dispatchEvent(down);
+            await sleep(20);
+            el.dispatchEvent(up);
+            await sleep(10);
+            try { el.click && el.click(); } catch (e) {}
+          } catch (e) { warn('method2 error', e); }
+        }
 
-      dispatchTo(target, 'mouseover');
-      await sleep(10);
-      dispatchTo(target, 'mousemove');
-      await sleep(10);
-      dispatchTo(target, 'mousedown');
-      // native click if available
-      try { el.click && el.click(); } catch (e) {}
-      await sleep(10);
-      dispatchTo(target, 'mouseup');
-      dispatchTo(target, 'click');
+        // Method 3: dispatch events to elementFromPoint (sometimes overlay intercepts)
+        else {
+          log('tryClickElement: method3 -> elementFromPoint dispatch + native click fallback');
+          try {
+            const target = document.elementFromPoint(cx, cy) || el;
+            ['mouseover','mousemove','mousedown'].forEach(t => {
+              try { target.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy })); } catch (e) {}
+            });
+            try { target.click && target.click(); } catch (e) {}
+            ['mouseup','click'].forEach(t => {
+              try { target.dispatchEvent(new MouseEvent(t, { view: window, bubbles: true, cancelable: true, clientX: cx, clientY: cy })); } catch (e) {}
+            });
+          } catch (e) { warn('method3 error', e); }
+        }
 
-      // success -> reset fail count
-      clickFailCount = 0;
-      log('humanClick: clicked element', el);
-      return true;
-    } catch (e) {
-      clickFailCount++;
-      warn('humanClick failed, count=', clickFailCount, e);
-      return false;
-    }
+        // wait a moment for UI to respond
+        await sleep(300 + Math.random() * 400);
+
+        // verify success: element removed OR not visible OR text no longer matches
+        try {
+          const stillInDom = document.contains(el);
+          const visibleNow = stillInDom && isVisible(el);
+          const textNow = stillInDom ? candidateText(el) : '';
+          const textMatches = textRegex.test(textNow);
+          log('tryClickElement: verification -> inDom:', stillInDom, 'visible:', visibleNow, 'textMatches:', textMatches);
+
+          if (!stillInDom || !visibleNow || !textMatches) {
+            // success: if still present mark processed, else can't (already removed)
+            try { if (stillInDom) el.dataset.__auto_declined = '1'; } catch (e) {}
+            clickFailCount = 0;
+            log('tryClickElement: success on attempt', attempt);
+            return true;
+          } else {
+            log('tryClickElement: not successful on attempt', attempt);
+            // continue to next attempt
+          }
+        } catch (e) {
+          warn('tryClickElement verification error', e);
+        }
+      } catch (e) {
+        warn('tryClickElement outer error', e);
+      }
+    } // attempts loop
+
+    // all attempts failed
+    clickFailCount++;
+    warn('tryClickElement: all attempts failed, clickFailCount=', clickFailCount);
+    return false;
   }
 
-  // --- heartbeat to keep tab active ---
+  // --- heartbeat ---
   let keepActiveTimer = null;
   function scheduleHeartbeat(settings) {
-    const heartbeat = () => { window.scrollBy(0,0); requestAnimationFrame(() => {}); };
+    const heartbeat = () => { window.scrollBy(0, 0); requestAnimationFrame(() => {}); };
     const run = () => {
       const t = settings.activeTabIntervalMin + Math.random() * (settings.activeTabIntervalMax - settings.activeTabIntervalMin);
       keepActiveTimer = setTimeout(() => { heartbeat(); run(); }, t);
     };
     run();
   }
+  function clearHeartbeat() { if (keepActiveTimer) { clearTimeout(keepActiveTimer); keepActiveTimer = null; } }
 
-  function clearHeartbeat() {
-    if (keepActiveTimer) { clearTimeout(keepActiveTimer); keepActiveTimer = null; }
-  }
-
-  // --- soft recovery (scroll up/down a bit) ---
+  // --- softRecovery (down-only) ---
   async function softRecovery(settings) {
-    log('softRecovery: start');
+    log('softRecovery: start (down-only)');
     try {
-      // small up/down cycles to provoke lazy loading
-      for (let i=0; i<2; i++) {
-        window.scrollBy({ top: 300, behavior: 'auto' });
-        await sleep(600);
-        window.scrollBy({ top: -300, behavior: 'auto' });
+      const step = Math.max(200, Math.round((window.innerHeight || 800) * 0.15));
+      for (let i = 0; i < 3; i++) {
+        const target = Math.min(document.documentElement.scrollHeight - window.innerHeight, window.scrollY + step);
+        log(`softRecovery: scrolling down to ${target} (step ${i+1})`);
+        window.scrollTo({ top: target, behavior: 'auto' });
         await sleep(600);
       }
       await sleep(400);
-    } catch (e) {
-      warn('softRecovery error', e);
-    }
+    } catch (e) { warn('softRecovery error', e); }
     log('softRecovery: done');
   }
 
@@ -198,7 +216,7 @@
   let __running = false;
   async function autoDeclineFB(opts = {}) {
     if (__running) {
-      log('autoDeclineFB: already running, exit');
+      log('autoDeclineFB: already running');
       return;
     }
     __running = true;
@@ -213,31 +231,27 @@
 
     let lastActionTime = Date.now();
     let cycles = 0;
-    let lastScrollHeight = document.documentElement.scrollHeight;
-    let stableScrollCount = 0;
     let softRecoveryAttempts = 0;
 
     try {
       while (window.__autoDeclineRunning) {
         cycles++;
-        log(`main loop #${cycles}: searching for action buttons`);
-        let buttons = findActionButtons();
+        log(`main loop #${cycles}: searching for action elements`);
+        const elems = findActionButtons();
 
-        if (buttons.length > 0) {
-          log(`found ${buttons.length} button(s) — clicking first one`);
-          // click first only, then re-evaluate as requested
-          const first = buttons[0];
-          const ok = await humanClick(first);
+        if (elems.length > 0) {
+          log(`found ${elems.length} element(s) — will try click on first one`);
+          const el = elems[0];
+          const ok = await tryClickElement(el, textRegex);
           if (ok) {
             lastActionTime = Date.now();
-            log('clicked successfully; waiting afterClickDelay', settings.clickDelay());
-            await sleep(settings.clickDelay());
-            // continue loop, search again
+            log('click succeeded; waiting afterClickDelay', settings.afterClickDelay);
+            await sleep(settings.afterClickDelay);
             continue;
           } else {
-            log('click failed; clickFailCount=', clickFailCount);
+            log('click attempts failed on this element');
             if (CLICK_FAIL_SOFT_RECOVERY && clickFailCount >= CLICK_FAIL_LIMIT) {
-              log('clickFailCount exceeded -> softRecovery attempt');
+              log('clickFailCount exceeded -> attempting softRecovery');
               await softRecovery(settings);
               softRecoveryAttempts++;
               if (clickFailCount >= CLICK_FAIL_LIMIT) {
@@ -252,106 +266,83 @@
                 }
               }
             } else {
-              // small pause and continue
+              // small pause and continue loop
               await sleep(300);
               continue;
             }
           }
         }
 
-        // no buttons found -> scroll strategy (progressive)
-        log('no buttons visible -> performing progressive scroll checks (25% steps x5 then full-height x5)');
+        // no visible matches: progressive down-only scrolls
+        log('no visible matches -> progressive scrolls (25% x5 then full-height x5) DOWN-ONLY');
         const totalHeight = Math.max(document.documentElement.scrollHeight, 1);
         const maxScrollTop = Math.max(0, totalHeight - window.innerHeight);
 
         // 5 steps of 25%
-        let foundDuringQuarterSteps = false;
+        let foundDuringQuarter = false;
         for (let i = 1; i <= 5; i++) {
           if (!window.__autoDeclineRunning) break;
           const target = Math.min(maxScrollTop, Math.round(totalHeight * 0.25 * i));
-          log(`quarter-step ${i}: scrolling to ${target} of ${maxScrollTop}`);
-          window.scrollTo({ top: target, behavior: 'auto' });
+          const effectiveTarget = target > window.scrollY ? target : Math.min(maxScrollTop, window.scrollY + Math.max(100, Math.round(totalHeight * 0.05)));
+          log(`quarter-step ${i}: scrolling down to ${effectiveTarget} (calc ${target}, cur ${window.scrollY})`);
+          window.scrollTo({ top: effectiveTarget, behavior: 'auto' });
           await sleep(settings.scrollWait);
           const got = findActionButtons();
-          if (got.length > 0) {
-            log(`found ${got.length} buttons after quarter-step ${i}`);
-            foundDuringQuarterSteps = true;
-            break;
-          }
+          if (got.length > 0) { log(`found ${got.length} after quarter ${i}`); foundDuringQuarter = true; break; }
         }
-        if (foundDuringQuarterSteps) {
-          log('buttons appeared during quarter-steps -> continue main loop');
-          continue;
-        }
+        if (foundDuringQuarter) continue;
 
-        // 5 steps of full window height
-        let foundDuringFullSteps = false;
+        // 5 steps full window height down
+        let foundDuringFull = false;
         for (let j = 1; j <= 5; j++) {
           if (!window.__autoDeclineRunning) break;
           const next = Math.min(window.scrollY + window.innerHeight, maxScrollTop);
-          log(`full-step ${j}: scrolling to ${next}`);
+          if (next <= window.scrollY && window.scrollY >= maxScrollTop) {
+            log(`full-step ${j}: at bottom (${window.scrollY}), breaking full-step loop`);
+            break;
+          }
+          log(`full-step ${j}: scrolling down to ${next}`);
           window.scrollTo({ top: next, behavior: 'auto' });
           await sleep(settings.endScrollDelay);
           const got = findActionButtons();
-          if (got.length > 0) {
-            log(`found ${got.length} buttons after full-step ${j}`);
-            foundDuringFullSteps = true;
-            break;
-          }
-          if (window.scrollY >= maxScrollTop) {
-            log('reached bottom during full-steps');
-          }
+          if (got.length > 0) { log(`found ${got.length} after full-step ${j}`); foundDuringFull = true; break; }
         }
-        if (foundDuringFullSteps) {
-          log('buttons appeared during full-steps -> continue main loop');
-          continue;
-        }
+        if (foundDuringFull) continue;
 
-        // extra check: do a short wait + retry
-        log('no buttons after progressive scrolls -> short wait and recheck');
+        // short wait + retry
+        log('no matches after progressive scrolls -> waiting and retrying');
         await sleep(800);
-        const retryButtons = findActionButtons();
-        if (retryButtons.length > 0) {
-          log(`buttons found on retry: ${retryButtons.length} -> continuing`);
-          lastActionTime = Date.now();
-          continue;
-        }
+        const retry = findActionButtons();
+        if (retry.length > 0) { log(`found ${retry.length} on retry`); lastActionTime = Date.now(); continue; }
 
-        // softRecovery attempts
+        // softRecovery attempts (down-only)
         softRecoveryAttempts++;
         if (softRecoveryAttempts <= SOFT_RECOVERY_ATTEMPTS) {
-          log(`softRecovery attempt #${softRecoveryAttempts}`);
+          log(`softRecovery attempt #${softRecoveryAttempts} (down-only)`);
           await softRecovery(settings);
           const after = findActionButtons();
-          if (after.length > 0) {
-            log(`buttons appeared after softRecovery #${softRecoveryAttempts} -> continue`);
-            lastActionTime = Date.now();
-            continue;
-          } else {
-            log(`softRecovery #${softRecoveryAttempts} didn't reveal buttons`);
-            continue; // next loop may attempt more scrolls
-          }
+          if (after.length > 0) { log(`found ${after.length} after softRecovery`); lastActionTime = Date.now(); continue; }
+          else { log('softRecovery did not reveal matches'); continue; }
         }
 
-        // after attempts exhausted -> decide reload or stop
+        // exhausted attempts -> reload if user started, else stop
         if (localStorage.getItem(STORAGE_KEY) === 'true') {
-          warn('No buttons after all attempts -> reloading page (user started)');
+          warn('No matches after all attempts -> reloading page (user started)');
           try { location.reload(); } catch (e) { warn('reload failed', e); }
           await sleep(settings.reloadDelay);
           return;
         } else {
-          log('No buttons after all attempts and user did not start -> stopping');
+          log('No matches after all attempts and user did not start -> stopping');
           break;
         }
 
-        // idle timeout fallback
-        // (note: placed at end, but we still check each loop)
+        // idle fallback (kept but down-only recovery)
         if (Date.now() - lastActionTime >= settings.idleTimeout) {
-          log('idleTimeout reached -> performing softRecovery then conditional reload/stop');
+          log('idleTimeout reached -> softRecovery (down-only) then conditional reload/stop');
           await softRecovery(settings);
           if (Date.now() - lastActionTime >= settings.idleTimeout) {
             if (localStorage.getItem(STORAGE_KEY) === 'true') {
-              warn('still idle after softRecovery -> reloading (user started)');
+              warn('idle persists -> reloading (user started)');
               try { location.reload(); } catch (e) { warn('reload failed', e); }
               await sleep(settings.reloadDelay);
               return;
@@ -362,10 +353,6 @@
           }
         }
 
-        if (cycles >= settings.maxCycles) {
-          log('maxCycles reached -> stopping to avoid infinite loop');
-          break;
-        }
       } // while
     } catch (e) {
       warn('autoDeclineFB encountered error', e);
@@ -377,20 +364,17 @@
     }
   }
 
-  // --- message handling from popup/background ---
+  // --- messages ---
   let tickNoButtonsCount = 0;
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try {
       log('onMessage:', msg, 'from', sender && sender.id ? sender.id : sender);
-
-      // optional: ignore messages not from our extension (if sender.id exists)
       try {
         if (sender && sender.id && chrome && chrome.runtime && chrome.runtime.id && sender.id !== chrome.runtime.id) {
           log('onMessage: message from other extension - ignoring');
           return;
         }
-      } catch (e) { /* ignore */ }
-
+      } catch (e) {}
       if (!msg || !msg.type) return;
 
       if (msg.type === 'start') {
@@ -406,7 +390,6 @@
       } else if (msg.type === 'status') {
         sendResponse && sendResponse({ running: !!window.__autoDeclineRunning });
       } else if (msg.type === 'tick') {
-        // tick processing: if buttons exist, try to click immediately; otherwise increase counter and try recovery after several ticks
         const settings = mergeOpts();
         const textRegex = new RegExp((settings.textPatterns || []).join('|'), 'i');
         const findActionButtons = makeFindActionButtons(textRegex);
@@ -416,10 +399,9 @@
           log(`tick: found ${found.length} buttons - attempting immediate quick clicks`);
           (async () => {
             try {
-              // click up to 2 items quickly
               const limit = Math.min(found.length, 2);
               for (let i=0; i<limit; i++) {
-                await humanClick(found[i]);
+                await tryClickElement(found[i], textRegex);
                 await sleep(200 + Math.random()*200);
               }
             } catch (e) { warn('tick immediate click error', e); }
@@ -429,7 +411,7 @@
           log('tick: no buttons; tickNoButtonsCount=', tickNoButtonsCount);
           if (tickNoButtonsCount >= TICK_RETRY_LIMIT) {
             tickNoButtonsCount = 0;
-            log('tick: exceeded TICK_RETRY_LIMIT -> softRecovery then conditional reload');
+            log('tick: exceeded TICK_RETRY_LIMIT -> softRecovery then conditional reload (down-only)');
             (async () => {
               await softRecovery(mergeOpts());
               const after = makeFindActionButtons(new RegExp((mergeOpts().textPatterns || []).join('|'), 'i'))();
@@ -448,12 +430,10 @@
           }
         }
       }
-    } catch (e) {
-      warn('onMessage handler error', e);
-    }
+    } catch (e) { warn('onMessage handler error', e); }
   });
 
-  // --- autostart on page load only if user previously pressed START ---
+  // autostart on load only if user previously pressed START
   window.addEventListener('load', () => {
     try {
       log('page load: checking autostart flag in localStorage');
@@ -464,11 +444,8 @@
       } else {
         log('page load: user flag absent -> not auto-starting');
       }
-    } catch (e) {
-      warn('load handler error', e);
-    }
+    } catch (e) { warn('load handler error', e); }
   });
 
-  // ready
   log('content.js ready (v' + SCRIPT_VERSION + ')');
 })();
