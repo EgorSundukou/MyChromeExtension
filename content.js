@@ -14,6 +14,7 @@
     VERSION: '2.0.0',
     STORAGE_KEY: '__autoDeclineUserStarted',
     STATS_KEY: '__autoDeclineStats',
+    EXIT_TEXT: 'Нет спама для показа',
     TEXT_PATTERNS: [
       'decline', 'reject', 'remove',
       'отклон', 'отклонить', 'отказать', 'удалить'
@@ -73,24 +74,51 @@
       } catch { return ''; }
     },
 
-    loadStats: () => {
-      const stored = sessionStorage.getItem(Config.STATS_KEY);
-      return stored ? parseInt(stored, 10) : 0;
+    loadStats: async () => {
+      const key = `${Config.STATS_KEY}_${State.tabId}`;
+      const res = await chrome.storage.local.get([key]);
+      return res[key] ? parseInt(res[key], 10) : 0;
     },
 
-    saveStats: (count) => {
-      sessionStorage.setItem(Config.STATS_KEY, count);
+    saveStats: async (count) => {
+      const key = `${Config.STATS_KEY}_${State.tabId}`;
+      await chrome.storage.local.set({ [key]: count });
     },
 
-    incrementStats: () => {
-      const current = Utils.loadStats();
-      Utils.saveStats(current + 1);
-      return current + 1;
+    incrementStats: async () => {
+      // Per-tab stats
+      const current = await Utils.loadStats();
+      const newTabCount = current + 1;
+      await Utils.saveStats(newTabCount);
+
+      // Global total stats
+      const totalKey = 'totalStats';
+      const data = await chrome.storage.local.get([totalKey]);
+      const newTotalCount = (data[totalKey] ? parseInt(data[totalKey], 10) : 0) + 1;
+      await chrome.storage.local.set({ [totalKey]: newTotalCount });
+
+      return newTabCount;
+    },
+
+    setStarted: async (val) => {
+      const key = `${Config.STORAGE_KEY}_${State.tabId}`;
+      if (val) await chrome.storage.local.set({ [key]: 'true' });
+      else await chrome.storage.local.remove([key]);
+    },
+
+    getIsStarted: async () => {
+      const key = `${Config.STORAGE_KEY}_${State.tabId}`;
+      const res = await chrome.storage.local.get([key]);
+      return res[key] === 'true';
     }
   };
 
   // --- DOM Interaction ---
   const DOM = {
+    hasExitText: (text) => {
+      return document.body && document.body.innerText.includes(text);
+    },
+
     findActionButtons: (textRegex) => {
       try {
         const nodes = Array.from(document.querySelectorAll('[role="button"], button, a'));
@@ -124,13 +152,17 @@
         // Stop check could be inserted here if we had a global abort signal
         if (!State.isRunning) return false;
 
-        Logger.log(`Click Attempt ${attempt} on`, el);
+        Logger.log(`Click Attempt ${attempt}`);
 
         try {
           el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
         } catch (e) { }
 
-        await Utils.sleep(Utils.randomDelay(60, 140));
+        // Dynamic Delay from settings
+        const data = await chrome.storage.local.get(["settings"]);
+        const min = (data.settings?.minDelay || 1) * 1000;
+        const max = (data.settings?.maxDelay || 2) * 1000;
+        await Utils.sleep(Utils.randomDelay(min, max));
 
         const rect = el.getBoundingClientRect();
         const cx = Math.round(rect.left + rect.width / 2);
@@ -150,13 +182,82 @@
         // Verification
         if (Clicker.verifySuccess(el, textRegex)) {
           Clicker.failCount = 0;
-          Utils.incrementStats(); // Update stats
+          const count = await Utils.incrementStats(); // Update stats (now async)
+          State.sessionDeclineCount++;
+
+          // Reset all error counters on any success
+          chrome.storage.local.set({
+            [`__emptyReloadCount_${State.tabId}`]: 0,
+            [`__failedGroupCount_${State.tabId}`]: 0,
+            [`__stuckAttemptCount_${State.tabId}`]: 0
+          });
+
+          // Check for periodic reload (every 100 declines on same page)
+          if (State.sessionDeclineCount >= 100) {
+            Logger.log(`Reached 100 declines on this page. Reloading to clear UI memory...`);
+            Main.handlePersistentFailure("UI Memory Cleanup");
+            return true;
+          }
+
+          // Check session limit (max actions per group)
+          const data = await chrome.storage.local.get(["settings"]);
+          if (data.settings && data.settings.maxDeclines > 0) {
+            if (count >= data.settings.maxDeclines) {
+              Logger.log(`Limit reached (${count}). Notifying background...`);
+              chrome.runtime.sendMessage({ type: "limitReached" });
+              await Main.stop();
+            }
+          }
           return true;
         }
       }
 
       Clicker.failCount++;
-      Logger.warn('All click attempts failed. Fail count:', Clicker.failCount);
+      Logger.warn('Click attempt failed. Fail count:', Clicker.failCount);
+
+      // If we clicked 3 times and button didn't disappear, it's stuck.
+      if (Clicker.failCount >= 3) {
+        Logger.warn('Button seems stuck. Attempting recovery reloads...');
+
+        const stuckKey = `__stuckAttemptCount_${State.tabId}`;
+        const data = await chrome.storage.local.get([stuckKey, "groupList"]);
+        const attempts = (data[stuckKey] || 0) + 1;
+
+        if (attempts >= 3) {
+          Logger.error("Button still stuck after 3 reloads. Interaction failure confirmed.");
+          await chrome.storage.local.set({ [stuckKey]: 0 }); // Reset for next group
+
+          // Interaction block check
+          const failData = await chrome.storage.local.get([`__failedGroupCount_${State.tabId}`]);
+          const failedGroups = (failData[`__failedGroupCount_${State.tabId}`] || 0) + 1;
+
+          if (failedGroups >= 2) {
+            Logger.error("Interaction block detected across 2 groups. Stopping completely.");
+            await Main.stop(true); // Total stop
+            return false;
+          }
+
+          // Move to next group
+          await chrome.storage.local.set({
+            [`__failedGroupCount_${State.tabId}`]: failedGroups,
+            [`__emptyReloadCount_${State.tabId}`]: 0
+          });
+
+          if (data.groupList && data.groupList.length > 0) {
+            Logger.log("Rotating to next group due to interaction failure...");
+            chrome.runtime.sendMessage({ type: "limitReached" });
+            await Main.stop(false); // Stop runtime but keep started flag
+          } else {
+            Logger.log("Interaction failed, no more groups. Stopping.");
+            await Main.stop(true);
+          }
+        } else {
+          // Try reloading the same page up to 3 times
+          Logger.log(`Reloading page to fix stuck button (Attempt ${attempts}/3)...`);
+          await chrome.storage.local.set({ [stuckKey]: attempts });
+          Main.handlePersistentFailure(`Stuck attempt ${attempts}`);
+        }
+      }
       return false;
     },
 
@@ -208,11 +309,13 @@
 
   // --- Core Logic ---
   const State = {
+    tabId: null, // Unique ID for this tab session
     isRunning: false,
     heartbeatTimer: null,
     tickNoButtonsCount: 0,
     softRecoveryAttempts: 0,
-    lastActionTime: 0
+    lastActionTime: 0,
+    sessionDeclineCount: 0 // Count since last page reload
   };
 
   const Navigation = {
@@ -235,24 +338,24 @@
       const totalHeight = Math.max(document.documentElement.scrollHeight, 1);
       const maxScroll = Math.max(0, totalHeight - window.innerHeight);
 
-      // Quarter Steps (Increased for more granual load attempts)
-      for (let i = 1; i <= 10; i++) {
+      // Quarter Steps (Reduced to 5)
+      for (let i = 1; i <= 5; i++) {
         if (!State.isRunning) return false;
-        // Calculate target relative to total height, but ensuring we move past current scroll
-        const target = Math.min(maxScroll, Math.round(totalHeight * (i * 0.1))); // 10% increments
+        // Calculate target relative to total height
+        const target = Math.round(totalHeight * (i * 0.2)); // 20% increments
 
         // If we are already past this target, just scroll down a bit more
         const effective = target > window.scrollY ? target : Math.min(maxScroll, window.scrollY + window.innerHeight * 0.5);
 
-        Logger.log(`Scroll Step (Small) ${i}/10 to ${effective}`);
+        Logger.log(`Scroll Step (Small) ${i}/5 to ${effective}`);
         await DOM.scrollTo(effective);
-        await Utils.sleep(Config.DELAYS.SCROLL_WAIT);
+        await Utils.sleep(2000); // Reduced from 4s to 2s for better responsiveness
 
         if (findCallback().length > 0) return true;
       }
 
-      // Full Page Steps (Increased depth for long lists)
-      for (let j = 1; j <= 15; j++) {
+      // Full Page Steps (Reduced to 5)
+      for (let j = 1; j <= 5; j++) {
         if (!State.isRunning) return false;
         const next = Math.min(window.scrollY + window.innerHeight, maxScroll);
 
@@ -261,7 +364,7 @@
           break;
         }
 
-        Logger.log(`Scroll Step (Full) ${j}/15 to ${next}`);
+        Logger.log(`Scroll Step (Full) ${j}/5 to ${next}`);
         await DOM.scrollTo(next);
         // FORCE a small scroll up and down to trigger lazy loaders
         window.scrollBy(0, -10);
@@ -300,7 +403,7 @@
     start: async () => {
       if (State.isRunning) return;
       State.isRunning = true;
-      sessionStorage.setItem(Config.STORAGE_KEY, 'true');
+      await Utils.setStarted(true);
       Logger.log('Started.');
 
       Heartbeat.start();
@@ -308,8 +411,24 @@
       const textRegex = new RegExp(Config.TEXT_PATTERNS.join('|'), 'i');
       State.lastActionTime = Date.now();
 
+      // Initial "Force Scroll" to trigger items if none found
+      if (DOM.findActionButtons(textRegex).length === 0) {
+        Logger.log('No buttons on load. Forcing initial scroll...');
+        await DOM.scrollTo(300);
+        await Utils.sleep(1500);
+        await DOM.scrollTo(0);
+        await Utils.sleep(500);
+      }
+
       try {
         while (State.isRunning) {
+          if (DOM.hasExitText(Config.EXIT_TEXT)) {
+            Logger.log('Exit message found. Moving to next group...');
+            chrome.runtime.sendMessage({ type: "limitReached" });
+            await Main.stop(false);
+            return;
+          }
+
           const buttons = DOM.findActionButtons(textRegex);
 
           if (buttons.length > 0) {
@@ -336,54 +455,76 @@
             }
           }
 
-          // No buttons found
-          Logger.log('No buttons found. Attempting scroll...');
+          // No buttons found on immediate scan, try scrolling
+          Logger.log('No buttons found. Attempting scroll discovery...');
           const foundAfterScroll = await Navigation.progressiveScroll(() => DOM.findActionButtons(textRegex));
           if (foundAfterScroll) continue;
 
-          // Retry after wait
-          await Utils.sleep(800);
-          if (DOM.findActionButtons(textRegex).length > 0) continue;
+          // Still no buttons after 5+5 scrolls
+          Logger.log('Discovery failed after all scroll attempts. Checking for empty group...');
 
-          // Soft Recovery
-          State.softRecoveryAttempts++;
-          if (State.softRecoveryAttempts <= Config.LIMITS.SOFT_RECOVERY_ATTEMPTS) {
-            await Navigation.softRecovery();
-            if (DOM.findActionButtons(textRegex).length > 0) continue;
-          }
+          if (await Utils.getIsStarted()) {
+            const data = await chrome.storage.local.get([
+              "groupList",
+              `__emptyReloadCount_${State.tabId}`,
+              `__failedGroupCount_${State.tabId}`
+            ]);
+            const emptyReloadCount = (data[`__emptyReloadCount_${State.tabId}`] || 0) + 1;
 
-          // Check Idle / Persistent Failure
-          if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
-            Main.handlePersistentFailure('No buttons found after all attempts');
+            Logger.log(`Empty detection: Attempt ${emptyReloadCount} for this group.`);
+
+            if (emptyReloadCount >= 2) {
+              // Truly empty in this group. Reset check for this group.
+              await chrome.storage.local.set({ [`__emptyReloadCount_${State.tabId}`]: 0 });
+
+              if (data.groupList && data.groupList.length > 0) {
+                Logger.log("Group seems empty. Rotating to next group...");
+                chrome.runtime.sendMessage({ type: "limitReached" });
+                await Main.stop(false); // Local stop only
+              } else {
+                Logger.log("Group seems empty. No more groups to rotate. Stopping.");
+                await Main.stop(true); // User-level stop
+              }
+              return;
+            }
+
+            // Record this "empty" attempt and reload
+            await chrome.storage.local.set({ [`__emptyReloadCount_${State.tabId}`]: emptyReloadCount });
+            Main.handlePersistentFailure('Empty discovery');
             return;
           } else {
             Logger.log('No buttons found and user did not auto-start. Stopping.');
-            Main.stop();
+            await Main.stop(false); // Stop runtime but don't clear started flag if user manually stopped?
+            // Actually if getIsStarted is false, it means it's ALREADY stopped.
             break;
           }
         }
       } catch (e) {
         Logger.error('Main loop crash:', e);
       } finally {
-        Main.stop();
+        // Only stop runtime, leave started flag alone unless explicit
+        State.isRunning = false;
+        Heartbeat.stop();
       }
     },
 
-    stop: () => {
+    stop: async (clearStarted = true) => {
       State.isRunning = false;
-      sessionStorage.removeItem(Config.STORAGE_KEY);
+      if (clearStarted) {
+        await Utils.setStarted(false);
+      }
       Heartbeat.stop();
-      Logger.log('Stopped.');
+      Logger.log(clearStarted ? 'Stopped (Permanent).' : 'Stopped (Session).');
     },
 
     handlePersistentFailure: async (reason) => {
       Logger.warn(`${reason} -> Reloading page...`);
       // We pause briefly to ensure logs are written/seen
-      if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
+      if (await Utils.getIsStarted()) {
         try { location.reload(); } catch (e) { Logger.error('Reload failed', e); }
         await Utils.sleep(Config.DELAYS.RELOAD);
       } else {
-        Main.stop();
+        await Main.stop();
       }
     }
   };
@@ -393,36 +534,49 @@
     // Ignore updates from other extensions if any
     if (sender.id && sender.id !== chrome.runtime.id) return;
 
-    switch (msg.type) {
-      case 'start':
-        Main.start();
-        sendResponse({ ok: true });
-        break;
-      case 'stop':
-        Main.stop();
-        sendResponse({ ok: true });
-        break;
-      case 'status':
-        sendResponse({
-          running: State.isRunning,
-          stats: Utils.loadStats()
-        });
-        break;
-      case 'tick':
-        if (!State.isRunning) {
-          // Check auto-start on content load / reload
-          // But this is just a 'tick' from background. Ideally we only check logic.
-        }
-        break;
-    }
+    (async () => {
+      switch (msg.type) {
+        case 'start':
+          await Main.start();
+          sendResponse({ ok: true });
+          break;
+        case 'stop':
+          await Main.stop();
+          sendResponse({ ok: true });
+          break;
+        case 'status':
+          const stats = await Utils.loadStats();
+          sendResponse({
+            running: State.isRunning,
+            stats: stats
+          });
+          break;
+      }
+    })();
+    return true; // async response
   });
 
-  // --- Auto-Start on Load ---
-  window.addEventListener('load', () => {
-    if (sessionStorage.getItem(Config.STORAGE_KEY) === 'true') {
-      setTimeout(() => Main.start(), 1000);
+  // --- Initialization & Auto-Start ---
+  const init = async () => {
+    try {
+      // Get Tab ID from background script
+      const response = await chrome.runtime.sendMessage({ type: 'getTabId' });
+      State.tabId = response.tabId;
+      Logger.log('Initialized with TabID:', State.tabId);
+
+      // Check auto-start
+      if (await Utils.getIsStarted()) {
+        Logger.log('Auto-starting session for this tab...');
+        setTimeout(() => Main.start(), 1000);
+      }
+    } catch (e) {
+      Logger.error('Init failed:', e);
     }
-  });
+  };
+
+  // Wait for document to be ready, or start if already loaded
+  if (document.readyState === 'complete') init();
+  else window.addEventListener('load', init);
 
   Logger.log('Ready.');
 
